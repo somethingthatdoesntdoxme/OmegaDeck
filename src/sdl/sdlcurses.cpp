@@ -353,11 +353,13 @@ int wnoutrefresh(WINDOW *w)
   if(w->clear_on_refresh)
   {
     w->clear_on_refresh = false;
+    fe_mark_dirty();
     for(auto &c : screen.cells)
     {
       c = {' ', nullptr};
     }
   }
+  bool changed = false;
   for(int y = 0; y < w->h; ++y)
   {
     int f = w->dirty_first[y];
@@ -365,6 +367,7 @@ int wnoutrefresh(WINDOW *w)
     {
       continue;
     }
+    changed = true;
     int l  = w->dirty_last[y];
     int sy = w->by + y;
     if(sy >= 0 && sy < screen.lines)
@@ -380,9 +383,21 @@ int wnoutrefresh(WINDOW *w)
     }
     w->dirty_first[y] = w->dirty_last[y] = -1;
   }
-  screen.cursor_y = w->by + w->cy;
-  screen.cursor_x = w->bx + w->cx;
-  fe_mark_dirty();
+  int ncy = w->by + w->cy, ncx = w->bx + w->cx;
+  if(ncy != screen.cursor_y || ncx != screen.cursor_x)
+  {
+    screen.cursor_y = ncy;
+    screen.cursor_x = ncx;
+    fe_mark_dirty();
+  }
+  if(changed)
+  {
+    if(w == screen.map_win)
+    {
+      ++screen.map_gen;
+    }
+    fe_mark_dirty();
+  }
   return OK;
 }
 
@@ -563,6 +578,10 @@ chtype winch(WINDOW *w)
 int wgetch(WINDOW *w)
 {
   wnoutrefresh(w); // like curses: getch refreshes the window
+  if(screen.cursor_win != w)
+  {
+    fe_mark_dirty();
+  }
   screen.cursor_win = w;
   screen.cursor_y   = w->by + w->cy;
   screen.cursor_x   = w->bx + w->cx;

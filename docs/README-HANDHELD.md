@@ -1,4 +1,4 @@
-# OmegaDeck: Omega for Steam Deck and other handhelds
+# OmegaDeck: Omega for Steam Deck, handhelds and PC
 
 This build of Omega has a 2D tile view, using the DawnLike pixel art, and you
 can play it entirely with a gamepad. The game rules haven't changed. Only the
@@ -17,8 +17,28 @@ DawnBringer (CC-BY 4.0). See `CREDITS.md` for everyone.
    a keyboard/mouse template. The game reads the pad directly.
 4. Go back to Gaming Mode and launch it.
 
-Saves go in `lib/saves/` inside the game folder. When you close the window
-during a game, the game saves to `Omega.sav` first.
+Saves, high scores and settings are kept in your user folder, not the game folder,
+so updating or reinstalling never wipes them:
+
+- SteamOS / Linux: `~/.local/share/OmegaDeck/`
+- Windows: `%APPDATA%\OmegaDeck\`
+
+When you close the window during a game, the game saves first.
+
+## Install on Windows (PCs, ROG Ally, Legion Go and so on)
+
+Unzip `OmegaDeck-windows-x64.zip` anywhere and run `omega.exe`. Xbox, PlayStation
+and Switch Pro pads work out of the box, and so do the built-in controls on Windows
+handhelds. To launch it from Steam Big Picture or a handheld's game launcher, add
+`omega.exe` as a non-Steam game.
+
+## Battery
+
+The game only redraws when something changes. If you leave it alone for 30 seconds,
+the idle animations stop and it uses next to no power. It also stops drawing while
+it's in the background (Steam overlay, alt-tab). On the Deck you can cap the frame
+rate in the performance menu too, but it isn't needed. To turn animations off
+completely, use the Display page described below.
 
 Release builds from GitHub Actions need SDL2 (SteamOS has it) and glibc 2.35 or newer. If it won't start
 on an older system, build it there (see "Building" below).
@@ -40,10 +60,14 @@ The hint bar at the bottom of the screen always shows what the buttons do right 
 | LT | Fire / throw (Hunt in the countryside) |
 | RT | Rest (Search in the countryside) |
 | L3 | Search |
-| R3 | Zoom the tiles (32 → 48 → 24 → 64 px) |
-| Start | System wheel (save, options, messages, help, quit) |
+| R3 | Cycle the tile zoom (24 / 32 / 40 / 48 / 64 px) |
+| Start | System wheel (save, options, messages, help, quit). Press RB for the **Display** page: zoom, hero sprite, animations, rumble, smooth camera, fullscreen. These settings are remembered. |
 | Select | On-screen keyboard (send any key) |
 | Touchscreen | Tap the map to step towards that spot, or tap menu lines and keys |
+
+The pad rumbles when you get hurt (harder for bigger hits), and damaged monsters show
+a health bar. The mouse pointer hides while you use the pad and comes back when you
+move the mouse.
 
 ### Prompts
 
@@ -68,7 +92,9 @@ A keyboard still works the same as in classic Omega.
 | `OMEGA_FULLSCREEN=1` | Start fullscreen (set by `omega.sh`; F11 switches it too) |
 | `OMEGA_WINDOW=1920x1080` | Window size when not fullscreen |
 | `OMEGA_TEXT_SIZE=24` | Text height in pixels (the default fits 40 rows on screen) |
-| `OMEGA_HERO=rogue` | Player sprite: `warrior`, `rogue`, `mage`, `paladin` |
+| `OMEGA_HERO=rogue` | Player sprite: `warrior`, `rogue`, `mage`, `paladin` (or pick it on the Display page) |
+| `OMEGA_ANIM=0` | No sprite animation at all |
+| `OMEGA_PORTABLE=1` | Keep saves next to the game instead of in your user folder |
 | `OMEGA_ASSETS=/path` | Where to find `tiles.rgba` and the other assets |
 
 ## Building
@@ -82,6 +108,16 @@ cmake --build build -j
 ```
 
 `-DOMEGA_SDL=OFF` builds the original curses version.
+
+To build for Windows, cross-compile from Linux with MinGW-w64. This script downloads SDL2 and makes the zip:
+
+```sh
+sudo apt install mingw-w64 cmake zip
+tools/package_windows.sh          # -> dist/OmegaDeck-windows-x64.zip
+```
+
+An MSVC build also works if you point CMake at the SDL2 VC development package
+(`-DSDL2_DIR=.../SDL2-2.x/cmake`).
 
 To regenerate the art (`assets/`) from DawnLike, clone
 <https://github.com/tommyettinger/DawnLikeAtlas> and run:
@@ -106,8 +142,8 @@ All the sprite choices (which sprite each monster, item and terrain uses) are in
 
 ## Releases
 
-GitHub Actions (`.github/workflows/handheld-release.yml`) builds every pull request.
-Each push to `main` publishes a release called `build-N`, and pushing a `v*` tag
-publishes a release named after the tag. Every release has
-`OmegaDeck-linux-x86_64.tar.gz` attached, ready for the GitHub Installer Decky plugin
-or a manual unpack.
+GitHub Actions (`.github/workflows/handheld-release.yml`) builds and smoke-tests every
+pull request on Linux and Windows. Each push to `main` publishes a release called
+`build-N`, and pushing a `v*` tag publishes a release named after the tag. Every release
+has `OmegaDeck-linux-x86_64.tar.gz` (ready for the GitHub Installer Decky plugin) and
+`OmegaDeck-windows-x64.zip` attached.

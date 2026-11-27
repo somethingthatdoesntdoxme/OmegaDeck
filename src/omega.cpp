@@ -20,6 +20,9 @@ Omega. If not, see <https://www.gnu.org/licenses/>.
 // omega.cpp
 
 #include "glob.h"
+#ifdef OMEGA_SDL
+#  include "sdl/frontend.hpp"
+#endif
 #include "scr.h"
 
 #include <array>
@@ -267,6 +270,11 @@ int main(int, char *[])
   {
     Omegalib = OMEGALIB;
   }
+#ifdef OMEGA_SDL
+  // saves and scores go in the user's data folder (see sdl_hooks.cpp)
+  static const std::string data_dir = omega_data_dir();
+  Omegalib                          = data_dir.c_str();
+#endif
 
   // if filecheck is false, some necessary data files are missing
   if(!filecheck())

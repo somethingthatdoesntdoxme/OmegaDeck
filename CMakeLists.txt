@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.5.0)
+if(POLICY CMP0091)
+  cmake_policy(SET CMP0091 NEW) # lets MSVC builds pick the static C++ runtime
+endif()
 project(Omega)
 
 if(NOT CMAKE_BUILD_TYPE)
@@ -137,8 +140,28 @@ if(OMEGA_SDL)
   endif()
   # Self-contained binary for handhelds: only SDL2 and libc are needed at runtime
   option(OMEGA_STATIC_RUNTIME "Statically link libstdc++/libgcc" ON)
-  if(OMEGA_STATIC_RUNTIME AND CMAKE_CXX_COMPILER_ID MATCHES "GNU" AND NOT WIN32)
-    target_link_options(omega PRIVATE -static-libstdc++ -static-libgcc)
+  if(OMEGA_STATIC_RUNTIME AND CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+    target_link_options(omega PRIVATE -static-libstdc++ -static-libgcc $<$<CONFIG:Release>:-s>)
+    if(WIN32)
+      target_link_options(omega PRIVATE -static) # no libwinpthread/libstdc++ DLLs to ship
+      # MinGW GCC 13 + C++23 + static libstdc++ defines type_info::operator== twice (GCC bug 110572)
+      target_link_options(omega PRIVATE -Wl,--allow-multiple-definition)
+    endif()
+  elseif(MSVC)
+    set_property(TARGET omega PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  endif()
+  if(WIN32)
+    # a normal windowed app: no console window behind the game
+    set_target_properties(omega PROPERTIES WIN32_EXECUTABLE TRUE)
+    if(MSVC)
+      target_link_options(omega PRIVATE /ENTRY:mainCRTStartup)
+    endif()
+    if(TARGET SDL2::SDL2)
+      add_custom_command(
+        TARGET omega POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:SDL2::SDL2> $<TARGET_FILE_DIR:omega>
+      )
+    endif()
   endif()
   add_custom_command(
     TARGET omega POST_BUILD

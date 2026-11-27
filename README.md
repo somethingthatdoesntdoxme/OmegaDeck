@@ -1,6 +1,6 @@
 # OmegaDeck
 
-**Omega, the 1987 roguelike, rebuilt for Steam Deck and other handhelds.** It has 2D pixel-art
+**Omega, the 1987 roguelike, rebuilt for Steam Deck, other handhelds and PC.** It has 2D pixel-art
 tiles and console-style controls, so you can play the whole game on a gamepad or touchscreen.
 
 ![OmegaDeck screenshots: overworld, action wheel, item picker, on-screen keyboard](docs/screenshots.png)
@@ -21,8 +21,12 @@ OmegaDeck adds the handheld frontend on top of it. Full credits are in
 - **On-screen keyboard.** It pops up by itself for wishes, names and numbers, and you can
   bring it up any time with Select.
 - **Touchscreen.** Tap the map to walk, and tap list entries and keyboard keys.
-- **Deck-ready releases.** GitHub Actions builds a tarball on every push to `main`. Unpack it,
-  add `omega.sh` to Steam, and pick the Gamepad controller template.
+- **Battery friendly.** It only redraws when something changes, and it sleeps completely
+  once you've been idle for a bit or the game is in the background.
+- **Little extras.** Smooth camera, health bars, rumble when you're hit, and a Display
+  settings page that remembers your zoom and hero sprite.
+- **Steam Deck, Linux and Windows releases.** GitHub Actions builds both on every push to
+  `main`. Saves live in your user folder, so updates never wipe them.
 
 See [docs/README-HANDHELD.md](docs/README-HANDHELD.md) for the controls, install steps and options.
 
