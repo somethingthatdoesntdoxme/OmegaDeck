@@ -25,6 +25,7 @@ struct sdl_screen
   int cursor_visibility = 0;
   const WINDOW *cursor_win = nullptr; // window that last asked for input
   const WINDOW *map_win    = nullptr; // the level window (drawn with tiles)
+  unsigned map_gen         = 0;       // bumped whenever the level window is redrawn
 };
 const sdl_screen &sdlc_screen();
 void sdlc_resized(int lines, int cols); // frontend -> shim
@@ -62,6 +63,10 @@ void omega_map_state(fe_map_state &);
 // Layer keys for the world cell (x,y) currently showing glyph `shown`, bottom first.
 // A key "glyph" means: draw the shown character itself.
 void omega_cell_keys(int x, int y, chtype shown, std::vector<std::string> &out);
+float omega_cell_health(int x, int y); // monster health 0..1 at a world cell, <0 = none
+float omega_player_health();          // 0..1
+bool omega_player_hp(int &hp, int &maxhp);
+std::string omega_data_dir();          // writable folder for saves and scores (with trailing /)
 int omega_context_key();          // what A does in the command loop
 std::string omega_context_label();
 void omega_window_closed();      // save and exit

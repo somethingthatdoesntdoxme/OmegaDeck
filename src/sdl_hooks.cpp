@@ -11,28 +11,95 @@ This file is part of Omega (GPL-3.0-or-later).
 #include "glob.h"
 #include "scr.h"
 
+#include "minit.h"
+
+#define SDL_MAIN_HANDLED
 #include <SDL.h>
 
+#include <filesystem>
 #include <string>
-#include <unistd.h>
+#include <system_error>
 #include <vector>
 
-// Omega looks for ./lib relative to the working directory. Launched from Steam
+namespace fs = std::filesystem;
+
+// Omega looks for its data relative to the working directory. Launched from Steam
 // or a desktop shortcut that's somewhere random, so start next to the binary.
 static const bool chdir_to_binary = [] {
   if(!SDL_getenv("OMEGA_NO_CHDIR"))
   {
     if(char *base = SDL_GetBasePath())
     {
-      if(chdir(base) != 0)
-      {
-        // fall back to the current directory
-      }
+      std::error_code ec;
+      fs::current_path(fs::u8path(base), ec);
       SDL_free(base);
     }
   }
   return true;
 }();
+
+// Saves and high scores live in the user's data folder, not next to the game, so
+// updating or reinstalling (e.g. via GitHub Installer) never wipes them:
+//   Linux/SteamOS: ~/.local/share/OmegaDeck/lib/    Windows: %APPDATA%\OmegaDeck\lib\
+// The game's data files are mirrored there from ./lib on every start.
+std::string omega_data_dir()
+{
+  static std::string dir;
+  if(!dir.empty())
+  {
+    return dir;
+  }
+  dir = OMEGALIB;
+  if(SDL_getenv("OMEGA_PORTABLE"))
+  {
+    return dir; // keep everything next to the game
+  }
+  char *pref = SDL_GetPrefPath("", "OmegaDeck");
+  if(!pref)
+  {
+    return dir;
+  }
+  fs::path dst = fs::u8path(pref) / "lib";
+  SDL_free(pref);
+  fs::path src = OMEGALIB;
+  std::error_code ec;
+  fs::create_directories(dst / "saves", ec);
+  if(ec)
+  {
+    return dir;
+  }
+  for(const auto &e : fs::recursive_directory_iterator(src, ec))
+  {
+    fs::path rel    = fs::relative(e.path(), src, ec);
+    fs::path target = dst / rel;
+    if(e.is_directory())
+    {
+      fs::create_directories(target, ec);
+      continue;
+    }
+    std::string name = rel.generic_string();
+    // player data: only ever seeded once (also migrates saves from older versions)
+    bool player_data = name.rfind("saves/", 0) == 0 || name == "omega.hi" || name == "omega.log" ||
+                       name.find(".lock") != std::string::npos;
+    if(player_data)
+    {
+      if(!fs::exists(target, ec) && name.find(".lock") == std::string::npos)
+      {
+        fs::copy_file(e.path(), target, ec);
+      }
+      continue;
+    }
+    // game data: keep in step with the installed version
+    if(!fs::exists(target, ec) || fs::file_size(target, ec) != e.file_size(ec) ||
+       fs::last_write_time(target, ec) < e.last_write_time(ec))
+    {
+      fs::copy_file(e.path(), target, fs::copy_options::overwrite_existing, ec);
+    }
+  }
+  auto u8 = (dst / "").u8string();
+  dir     = std::string(u8.begin(), u8.end());
+  return dir;
+}
 
 namespace
 {
@@ -295,4 +362,39 @@ void omega_window_closed()
 void omega_debug_change_env(int env)
 {
   change_environment(env);
+}
+
+float omega_cell_health(int x, int y)
+{
+  if(Current_Environment == E_COUNTRYSIDE || !Level || x < 0 || y < 0 || x >= WIDTH || y >= LENGTH)
+  {
+    return -1.0f;
+  }
+  const monster *m = Level->site[x][y].creature;
+  if(!m || m->id < 0 || m->id >= static_cast<int>(Monsters.size()))
+  {
+    return -1.0f;
+  }
+  int full = std::max(Monsters[m->id].hp, 1);
+  return m->hp >= full ? -1.0f : static_cast<float>(m->hp) / full;
+}
+
+float omega_player_health()
+{
+  if(!game_running() || Player.maxhp <= 0)
+  {
+    return -1.0f;
+  }
+  return static_cast<float>(Player.hp) / Player.maxhp;
+}
+
+bool omega_player_hp(int &hp, int &maxhp)
+{
+  if(!game_running())
+  {
+    return false;
+  }
+  hp    = Player.hp;
+  maxhp = Player.maxhp;
+  return true;
 }

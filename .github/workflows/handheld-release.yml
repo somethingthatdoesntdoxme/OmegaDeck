@@ -1,9 +1,9 @@
-name: Handheld build
+name: Build
 
-# Builds the SDL2/gamepad version for Steam Deck and other Linux handhelds.
-#  - pull requests: build only, tarball attached to the run as an artifact
-#  - push to main:  build + publish a GitHub release (build-<number>)
-#  - tag v*:        build + publish a release named after the tag
+# Builds OmegaDeck for Linux handhelds (Steam Deck etc.) and Windows.
+#  - pull requests: build + smoke test, packages attached to the run as artifacts
+#  - push to main:  ...and publish a GitHub release (build-<number>)
+#  - tag v*:        ...and publish a release named after the tag
 on:
   push:
     branches: [main]
@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  linux:
     # 22.04 = glibc 2.35, so the binary runs on older SteamOS / distros too
     runs-on: ubuntu-22.04
     steps:
@@ -25,7 +25,7 @@ jobs:
         run: |
           sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
           sudo apt-get update
-          sudo apt-get install -y g++-13 libsdl2-dev cmake
+          sudo apt-get install -y g++-13 libsdl2-dev cmake xvfb
 
       - name: Build and package
         env:
@@ -37,7 +37,6 @@ jobs:
 
       - name: Smoke test (headless start)
         run: |
-          sudo apt-get install -y xvfb
           printf 'shot /tmp/title.bmp\nquit\n' > /tmp/script.txt
           cd dist/omega-handheld
           SDL_RENDER_DRIVER=software OMEGA_PAD_SCRIPT=/tmp/script.txt \
@@ -49,23 +48,83 @@ jobs:
           name: OmegaDeck-linux-x86_64
           path: dist/OmegaDeck-linux-x86_64.tar.gz
 
+  windows-build:
+    # cross-compiled with MinGW-w64: one static exe + SDL2.dll, no runtime installers
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MinGW-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 cmake zip
+
+      - name: Build and package
+        run: tools/package_windows.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OmegaDeck-windows-x64
+          path: dist/OmegaDeck-windows-x64.zip
+
+  windows-test:
+    # run the real thing on Windows to make sure it starts and draws
+    needs: windows-build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: OmegaDeck-windows-x64
+
+      - name: Smoke test (start + screenshot)
+        shell: pwsh
+        run: |
+          Expand-Archive OmegaDeck-windows-x64.zip -DestinationPath .
+          $shot = Join-Path $env:RUNNER_TEMP 'title.bmp'
+          $script = Join-Path $env:RUNNER_TEMP 'script.txt'
+          "shot $shot`nquit`n" | Set-Content -NoNewline $script
+          $env:OMEGA_PAD_SCRIPT = $script
+          $env:SDL_RENDER_DRIVER = 'software'
+          $p = Start-Process -FilePath .\OmegaDeck-windows\omega.exe -WorkingDirectory .\OmegaDeck-windows -PassThru
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'omega.exe did not exit' }
+          if (-not (Test-Path $shot) -or (Get-Item $shot).Length -lt 1000) { throw 'no screenshot' }
+          Write-Host "ok: $((Get-Item $shot).Length) byte screenshot"
+
+  release:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [linux, windows-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Publish release
-        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('build-{0}', github.run_number) }}
           name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('OmegaDeck build {0}', github.run_number) }}
           target_commitish: ${{ github.sha }}
           make_latest: true
-          files: dist/OmegaDeck-linux-x86_64.tar.gz
+          files: |
+            dist/OmegaDeck-linux-x86_64.tar.gz
+            dist/OmegaDeck-windows-x64.zip
           body: |
             **OmegaDeck**: the 1987 roguelike Omega with 2D tiles and gamepad controls,
-            built for Steam Deck and other Linux handhelds.
+            for Steam Deck, other handhelds and PC.
 
-            **Install:** unpack anywhere in your home folder, add `omega.sh` to Steam as a
-            non-Steam game, and pick the **Gamepad** controller template.
-            Controls and options are in `README-HANDHELD.md` inside the archive.
-            Needs SDL2 (SteamOS has it) and glibc 2.35 or newer.
+            **Steam Deck / Linux** (`OmegaDeck-linux-x86_64.tar.gz`): unpack anywhere in
+            your home folder, add `omega.sh` to Steam as a non-Steam game, and use the
+            **Gamepad** controller template. Needs SDL2 (SteamOS has it) and glibc 2.35+.
+
+            **Windows** (`OmegaDeck-windows-x64.zip`): unzip anywhere and run `omega.exe`.
+            Works with Xbox/PlayStation pads, Windows handhelds (ROG Ally, Legion Go) and
+            keyboard. To launch it from Steam Big Picture, add `omega.exe` as a non-Steam game.
+
+            Saves and settings live in your user folder (`~/.local/share/OmegaDeck` or
+            `%APPDATA%\OmegaDeck`), so updating never wipes them. Controls and options
+            are in `README-HANDHELD.md` inside each download.
 
             **Credits:** Omega by Laurence R. Brothers, with Erik Max Francis, Nathan Glasser,
             Robert Rendell, William Tanksley and other contributors. C++ port by Lyle Tafoya.

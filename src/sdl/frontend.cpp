@@ -7,12 +7,17 @@ This file is part of Omega (GPL-3.0-or-later).
 #include "frontend.hpp"
 #include "../omega_ui.hpp"
 
+#define SDL_MAIN_HANDLED
 #include <SDL.h>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <fstream>
@@ -24,7 +29,8 @@ This file is part of Omega (GPL-3.0-or-later).
 
 namespace
 {
-constexpr int ESC = 27;
+constexpr int ESC   = 27;
+constexpr double PI = 3.14159265358979323846;
 
 // --------------------------------------------------------------- state ----
 SDL_Window *window     = nullptr;
@@ -36,8 +42,8 @@ int win_w = 1280, win_h = 800;
 int hint_h = 30;
 std::string asset_dir;
 
-const std::array<int, 4> TILE_SIZES = {32, 48, 24, 64};
-int tile_zoom = 0;
+const std::array<int, 5> TILE_SIZES = {24, 32, 40, 48, 64};
+int tile_zoom = 1;
 
 struct sprite
 {
@@ -63,6 +69,20 @@ bool dirty            = true;
 Uint32 last_present   = 0;
 Uint32 flash_until    = 0;
 Uint32 anim_clock     = 0;
+Uint32 last_input     = 0;     // last time the player touched anything
+Uint32 last_move_time = 0;     // last time the hero stepped (walk animation)
+Uint32 anim_due_at    = 0;     // next time an animation frame changes
+bool backgrounded     = false; // window hidden / unfocused
+bool minimized        = false;
+bool anim_enabled     = true;
+bool rumble_enabled   = true;
+int last_hp = -1, last_maxhp = -1;
+constexpr Uint32 IDLE_FREEZE_MS = 30000; // stop animating after this long without input
+
+bool animating_now()
+{
+  return anim_enabled && !backgrounded && !minimized && SDL_GetTicks() - last_input < IDLE_FREEZE_MS;
+}
 
 SDL_GameController *pad = nullptr;
 enum vbtn
@@ -409,7 +429,7 @@ const std::vector<layer> *resolve(const std::string &key, const std::string &env
   return find_key(key);
 }
 
-void draw_layers(const std::vector<layer> &ls, const std::string &env, int x, int y, int sz, int depth = 0)
+void flatten(const std::vector<layer> &ls, const std::string &env, std::vector<const layer *> &out, int depth = 0)
 {
   for(const layer &l : ls)
   {
@@ -419,24 +439,40 @@ void draw_layers(const std::vector<layer> &ls, const std::string &env, int x, in
       {
         if(auto *r = resolve(l.ref, env))
         {
-          draw_layers(*r, env, x, y, sz, depth + 1);
+          flatten(*r, env, out, depth + 1);
         }
       }
       continue;
     }
-    const sprite &s = sprites[l.sprite];
-    int nf          = static_cast<int>(s.frames.size());
-    int f           = nf > 1 ? static_cast<int>((anim_clock / (nf > 2 ? 180 : 500)) % nf) : 0;
-    SDL_Rect dst{x, y, sz, sz};
-    if(l.tinted)
+    out.push_back(&l);
+  }
+}
+
+void draw_layer(const layer &l, int x, int y, int sz, bool walking)
+{
+  const sprite &s = sprites[l.sprite];
+  int nf          = static_cast<int>(s.frames.size());
+  int f           = 0;
+  if(nf > 1 && animating_now())
+  {
+    if(nf > 2)
     {
-      SDL_SetTextureColorMod(tex_tiles, l.tr, l.tg, l.tb);
+      f = walking ? static_cast<int>((anim_clock / 150) % nf) : 0; // walk cycle only while moving
     }
-    SDL_RenderCopy(renderer, tex_tiles, &s.frames[f], &dst);
-    if(l.tinted)
+    else
     {
-      SDL_SetTextureColorMod(tex_tiles, 255, 255, 255);
+      f = static_cast<int>((anim_clock / 500) % nf); // DawnLike's two-frame idle bob
     }
+  }
+  SDL_Rect dst{x, y, sz, sz};
+  if(l.tinted)
+  {
+    SDL_SetTextureColorMod(tex_tiles, l.tr, l.tg, l.tb);
+  }
+  SDL_RenderCopy(renderer, tex_tiles, &s.frames[f], &dst);
+  if(l.tinted)
+  {
+    SDL_SetTextureColorMod(tex_tiles, 255, 255, 255);
   }
 }
 
@@ -534,118 +570,72 @@ int cell_x(const sdl_screen &scr, int r, int c)
   return c * cw;
 }
 
-void draw_map(const sdl_screen &scr)
+// Everything about a map cell that only changes when the game redraws it.
+// Built once per game update; animation-only frames just replay it.
+struct cell_draw
 {
-  view.active = false;
-  const WINDOW *w = scr.map_win;
-  if(!w)
-  {
-    return;
-  }
-  fe_map_state ms;
-  omega_map_state(ms);
-  if(!ms.valid)
-  {
-    return;
-  }
-  view.active = true;
-  view.w      = w;
-  view.rect   = {w->bx * cw, w->by * ch, (w->w + side_shift(scr)) * cw, w->h * ch};
-  view.tile   = std::max(16, TILE_SIZES[tile_zoom] * ch / 20);
-  int sz      = view.tile;
+  std::vector<const layer *> layers; // flattened, bottom first
+  bool glyph  = false; // draw the character itself on top
+  bool player = false;
+  float hp    = -1.0f; // health bar fraction, <0 = none
+};
+struct map_cache_t
+{
+  unsigned gen = ~0u;
+  int hoff = 0, voff = 0, ww = 0, wh = 0;
+  std::string env;
+  char facing = 0;
+  std::vector<cell_draw> cells;
+} mcache;
 
-  // camera target: the targeting cursor, else the player
-  float tx = static_cast<float>(ms.px - ms.hoff), ty = static_cast<float>(ms.py - ms.voff);
-  ui_mode m = mode();
-  if((m == UI_TARGET || m == UI_LOOK) && scr.cursor_win == w)
+float cam_wx = 0, cam_wy = 0; // camera, world coords (smoothed)
+bool cam_ok      = false;
+bool cam_moving  = false;
+Uint32 cam_time  = 0;
+bool smooth_camera = true;
+
+void build_map_cache(const sdl_screen &scr, const WINDOW *w, const fe_map_state &ms)
+{
+  mcache.gen    = scr.map_gen;
+  mcache.hoff   = ms.hoff;
+  mcache.voff   = ms.voff;
+  mcache.ww     = w->w;
+  mcache.wh     = w->h;
+  mcache.env    = ms.env;
+  mcache.facing = facing;
+  int W = w->w, H = w->h;
+  std::vector<std::vector<std::string>> keys(static_cast<size_t>(W) * H);
+  for(int y = 0; y < H; ++y)
   {
-    tx = static_cast<float>(scr.cursor_x - w->bx);
-    ty = static_cast<float>(scr.cursor_y - w->by);
-  }
-  float vis_w = static_cast<float>(view.rect.w) / sz, vis_h = static_cast<float>(view.rect.h) / sz;
-  auto cam    = [](float t, float vis, int extent) {
-    if(vis >= extent)
+    for(int x = 0; x < W; ++x)
     {
-      return (extent - vis) / 2.0f;
+      chtype c = w->cells[y * W + x];
+      if((c & A_CHARTEXT) != ' ')
+      {
+        omega_cell_keys(x + ms.hoff, y + ms.voff, c, keys[y * W + x]);
+      }
     }
-    return std::clamp(t + 0.5f - vis / 2.0f, 0.0f, extent - vis);
+  }
+  auto base = [&](int x, int y) -> const std::string & {
+    static const std::string none;
+    if(x < 0 || y < 0 || x >= W || y >= H || keys[y * W + x].empty())
+    {
+      return none;
+    }
+    return keys[y * W + x].front();
   };
-  view.cam_x = cam(tx, vis_w, w->w);
-  view.cam_y = cam(ty, vis_h, w->h);
-
-  // facing from movement
-  if(ms.px != last_px || ms.py != last_py)
+  mcache.cells.assign(static_cast<size_t>(W) * H, {});
+  for(int y = 0; y < H; ++y)
   {
-    if(last_px >= 0 && std::abs(ms.px - last_px) <= 1 && std::abs(ms.py - last_py) <= 1)
+    for(int x = 0; x < W; ++x)
     {
-      if(ms.px > last_px) facing = 'e';
-      else if(ms.px < last_px) facing = 'w';
-      else if(ms.py > last_py) facing = 's';
-      else if(ms.py < last_py) facing = 'n';
-    }
-    last_px = ms.px;
-    last_py = ms.py;
-  }
-
-  SDL_RenderSetClipRect(renderer, &view.rect);
-  fill(view.rect.x, view.rect.y, view.rect.w, view.rect.h, {12, 10, 16, 255});
-
-  int x0 = static_cast<int>(std::floor(view.cam_x)) - 1, y0 = static_cast<int>(std::floor(view.cam_y)) - 1;
-  int x1 = static_cast<int>(std::ceil(view.cam_x + vis_w)) + 1, y1 = static_cast<int>(std::ceil(view.cam_y + vis_h)) + 1;
-  int gw = x1 - x0 + 1, gh = y1 - y0 + 1;
-  std::vector<std::vector<std::string>> grid(static_cast<size_t>(gw) * gh);
-  auto at = [&](int x, int y) -> std::vector<std::string> & { return grid[(y - y0) * gw + (x - x0)]; };
-  for(int y = y0; y <= y1; ++y)
-  {
-    for(int x = x0; x <= x1; ++x)
-    {
-      if(x < 0 || y < 0 || x >= w->w || y >= w->h)
-      {
-        continue;
-      }
-      chtype c = w->cells[y * w->w + x];
-      if((c & A_CHARTEXT) == ' ')
-      {
-        continue;
-      }
-      omega_cell_keys(x + ms.hoff, y + ms.voff, c, at(x, y));
-    }
-  }
-  auto base = [&](int x, int y) -> std::string {
-    if(x < x0 || y < y0 || x > x1 || y > y1)
-    {
-      return {};
-    }
-    auto &v = at(x, y);
-    return v.empty() ? std::string() : v.front();
-  };
-
-  for(int y = y0; y <= y1; ++y)
-  {
-    for(int x = x0; x <= x1; ++x)
-    {
-      if(x < 0 || y < 0 || x >= w->w || y >= w->h)
-      {
-        continue;
-      }
-      auto &keys = at(x, y);
-      if(keys.empty())
-      {
-        continue;
-      }
-      int px = view.rect.x + static_cast<int>(std::lround((x - view.cam_x) * sz));
-      int py = view.rect.y + static_cast<int>(std::lround((y - view.cam_y) * sz));
-      chtype shown = w->cells[y * w->w + x];
-      for(const std::string &k0 : keys)
+      cell_draw &cd = mcache.cells[y * W + x];
+      for(const std::string &k0 : keys[y * W + x])
       {
         std::string k = k0;
         if(k == "glyph")
         {
-          SDL_Color fg, bg;
-          bool hb;
-          cell_colors(shown, fg, bg, hb);
-          int gw2 = sz * font_w / font_h;
-          glyph(px + (sz - gw2) / 2, py, gw2, sz, shown & A_CHARTEXT, fg, true);
+          cd.glyph = true;
           continue;
         }
         if(k.rfind("pool:", 0) == 0)
@@ -654,10 +644,10 @@ void draw_map(const sdl_screen &scr)
         }
         if(k == "player")
         {
-          std::string pk = "player:" + player_set + ":" + std::string(1, facing);
-          if(auto *l = find_key(pk))
+          cd.player = true;
+          if(auto *l = find_key("player:" + player_set + ":" + std::string(1, facing)))
           {
-            draw_layers(*l, ms.env, px, py, sz);
+            flatten(*l, ms.env, cd.layers);
             continue;
           }
         }
@@ -669,7 +659,7 @@ void draw_map(const sdl_screen &scr)
           {
             for(int dx = -1; dx <= 1; ++dx)
             {
-              std::string n = base(x + dx, y + dy);
+              const std::string &n = base(x + dx, y + dy);
               if(!(n.empty() || n == "wall"))
               {
                 interior = false;
@@ -690,22 +680,161 @@ void draw_map(const sdl_screen &scr)
           }
           if(l)
           {
-            draw_layers(*l, ms.env, px, py, sz);
+            flatten(*l, ms.env, cd.layers);
             continue;
           }
         }
         if(auto *l = resolve(k, ms.env))
         {
-          draw_layers(*l, ms.env, px, py, sz);
+          flatten(*l, ms.env, cd.layers);
         }
         else
         {
-          SDL_Color fg, bg;
-          bool hb;
-          cell_colors(shown, fg, bg, hb);
-          int gw2 = sz * font_w / font_h;
-          glyph(px + (sz - gw2) / 2, py, gw2, sz, shown & A_CHARTEXT, fg, true);
+          cd.glyph = true;
         }
+      }
+      if(!keys[y * W + x].empty())
+      {
+        cd.hp = omega_cell_health(x + ms.hoff, y + ms.voff);
+      }
+    }
+  }
+}
+
+void health_bar(int x, int y, int sz, float f)
+{
+  int h  = std::max(2, sz / 10);
+  int bw = sz - sz / 4;
+  int bx = x + (sz - bw) / 2, by = y + sz - h - 1;
+  fill(bx - 1, by - 1, bw + 2, h + 2, {0, 0, 0, 200});
+  SDL_Color c = f > 0.6f ? SDL_Color{80, 200, 80, 255} : (f > 0.3f ? SDL_Color{230, 190, 50, 255} : SDL_Color{220, 60, 50, 255});
+  fill(bx, by, std::max(1, static_cast<int>(bw * std::clamp(f, 0.0f, 1.0f))), h, c);
+}
+
+void draw_map(const sdl_screen &scr)
+{
+  view.active = false;
+  cam_moving  = false;
+  const WINDOW *w = scr.map_win;
+  if(!w)
+  {
+    return;
+  }
+  fe_map_state ms;
+  omega_map_state(ms);
+  if(!ms.valid)
+  {
+    cam_ok = false;
+    return;
+  }
+  view.active = true;
+  view.w      = w;
+  view.rect   = {w->bx * cw, w->by * ch, (w->w + side_shift(scr)) * cw, w->h * ch};
+  view.tile   = std::max(16, TILE_SIZES[tile_zoom] * ch / 20);
+  int sz      = view.tile;
+
+  // facing from movement
+  if(ms.px != last_px || ms.py != last_py)
+  {
+    if(last_px >= 0 && std::abs(ms.px - last_px) <= 1 && std::abs(ms.py - last_py) <= 1)
+    {
+      if(ms.px > last_px) facing = 'e';
+      else if(ms.px < last_px) facing = 'w';
+      else if(ms.py > last_py) facing = 's';
+      else if(ms.py < last_py) facing = 'n';
+      last_move_time = SDL_GetTicks();
+    }
+    last_px = ms.px;
+    last_py = ms.py;
+  }
+
+  if(mcache.gen != scr.map_gen || mcache.hoff != ms.hoff || mcache.voff != ms.voff || mcache.ww != w->w ||
+     mcache.wh != w->h || mcache.env != ms.env || mcache.facing != facing)
+  {
+    build_map_cache(scr, w, ms);
+  }
+
+  // camera target: the targeting cursor, else the player
+  float tx = static_cast<float>(ms.px - ms.hoff), ty = static_cast<float>(ms.py - ms.voff);
+  ui_mode m = mode();
+  if((m == UI_TARGET || m == UI_LOOK) && scr.cursor_win == w)
+  {
+    tx = static_cast<float>(scr.cursor_x - w->bx);
+    ty = static_cast<float>(scr.cursor_y - w->by);
+  }
+  float vis_w = static_cast<float>(view.rect.w) / sz, vis_h = static_cast<float>(view.rect.h) / sz;
+  auto cam    = [](float t, float vis, int extent) {
+    if(vis >= extent)
+    {
+      return (extent - vis) / 2.0f;
+    }
+    return std::clamp(t + 0.5f - vis / 2.0f, 0.0f, extent - vis);
+  };
+  // smooth the camera in world coordinates so the game's own screen scrolling glides too
+  float twx  = cam(tx, vis_w, w->w) + ms.hoff, twy = cam(ty, vis_h, w->h) + ms.voff;
+  Uint32 now = SDL_GetTicks();
+  if(!cam_ok || !smooth_camera || std::fabs(twx - cam_wx) > 12 || std::fabs(twy - cam_wy) > 12)
+  {
+    cam_wx = twx;
+    cam_wy = twy;
+    cam_ok = true;
+  }
+  else
+  {
+    float dt = std::min<Uint32>(now - cam_time, 33) / 1000.0f;
+    float k  = 1.0f - std::exp(-dt * 14.0f);
+    cam_wx += (twx - cam_wx) * k;
+    cam_wy += (twy - cam_wy) * k;
+    if(std::fabs(twx - cam_wx) < 0.02f && std::fabs(twy - cam_wy) < 0.02f)
+    {
+      cam_wx = twx;
+      cam_wy = twy;
+    }
+    else
+    {
+      cam_moving = true;
+    }
+  }
+  cam_time   = now;
+  view.cam_x = cam_wx - ms.hoff;
+  view.cam_y = cam_wy - ms.voff;
+
+  SDL_RenderSetClipRect(renderer, &view.rect);
+  fill(view.rect.x, view.rect.y, view.rect.w, view.rect.h, {12, 10, 16, 255});
+
+  int x0 = std::max(0, static_cast<int>(std::floor(view.cam_x)));
+  int y0 = std::max(0, static_cast<int>(std::floor(view.cam_y)));
+  int x1 = std::min(w->w - 1, static_cast<int>(std::ceil(view.cam_x + vis_w)));
+  int y1 = std::min(w->h - 1, static_cast<int>(std::ceil(view.cam_y + vis_h)));
+  bool walking = SDL_GetTicks() - last_move_time < 700;
+  for(int y = y0; y <= y1; ++y)
+  {
+    for(int x = x0; x <= x1; ++x)
+    {
+      const cell_draw &cd = mcache.cells[y * w->w + x];
+      if(cd.layers.empty() && !cd.glyph)
+      {
+        continue;
+      }
+      int px = view.rect.x + static_cast<int>(std::lround((x - view.cam_x) * sz));
+      int py = view.rect.y + static_cast<int>(std::lround((y - view.cam_y) * sz));
+      for(const layer *l : cd.layers)
+      {
+        draw_layer(*l, px, py, sz, cd.player && walking);
+      }
+      if(cd.glyph)
+      {
+        chtype shown = w->cells[y * w->w + x];
+        SDL_Color fg, bg;
+        bool hb;
+        cell_colors(shown, fg, bg, hb);
+        int gw2 = sz * font_w / font_h;
+        glyph(px + (sz - gw2) / 2, py, gw2, sz, shown & A_CHARTEXT, fg, true);
+      }
+      float hp = cd.player ? omega_player_health() : cd.hp;
+      if(hp >= 0.0f && hp < 0.999f)
+      {
+        health_bar(px, py, sz, hp);
       }
     }
   }
@@ -716,10 +845,9 @@ void draw_map(const sdl_screen &scr)
     int cx_ = scr.cursor_x - w->bx, cy_ = scr.cursor_y - w->by;
     int px  = view.rect.x + static_cast<int>(std::lround((cx_ - view.cam_x) * sz));
     int py  = view.rect.y + static_cast<int>(std::lround((cy_ - view.cam_y) * sz));
-    uint8_t a = static_cast<uint8_t>(160 + 95 * std::sin(anim_clock / 150.0));
-    outline(px, py, sz, sz, {255, 230, 80, a}, std::max(2, sz / 16));
+    outline(px, py, sz, sz, {255, 230, 80, 235}, std::max(2, sz / 16));
   }
-  // direction arrows around the player
+  // direction markers around the player
   if(mode() == UI_DIRECTION)
   {
     int pcx = view.rect.x + static_cast<int>(std::lround((ms.px - ms.hoff - view.cam_x) * sz)) + sz / 2;
@@ -880,8 +1008,7 @@ void draw_options(const sdl_screen &scr)
   {
     const option &o = options[std::clamp(opt_sel, 0, static_cast<int>(options.size()) - 1)];
     int y           = o.row * ch;
-    uint8_t a       = static_cast<uint8_t>(70 + 30 * std::sin(anim_clock / 200.0));
-    fill(0, y, std::min(scr.cols, 64) * cw, ch, {255, 220, 80, a});
+    fill(0, y, std::min(scr.cols, 64) * cw, ch, {255, 220, 80, 80});
     outline(0, y, std::min(scr.cols, 64) * cw, ch, {255, 220, 80, 220}, 2);
     return;
   }
@@ -911,6 +1038,19 @@ struct radial_item
   int key;
   const char *label;
 };
+// radial entries with these "keys" are handled by the frontend itself
+enum fe_action
+{
+  FE_ZOOM_IN = 0x10000,
+  FE_ZOOM_OUT,
+  FE_HERO,
+  FE_ANIM,
+  FE_RUMBLE,
+  FE_SMOOTH,
+  FE_FULLSCREEN,
+  FE_CLOSE,
+};
+const char *HEROES[] = {"warrior", "rogue", "mage", "paladin"};
 struct radial_page_def
 {
   const char *name;
@@ -927,12 +1067,16 @@ const radial_page_def DUNGEON_PAGES[] = {
             {'Z', "Bash item"}, {'M', "City move"}, {'C', "Call item"}, {'/', "What's that?"}}}},
   {"System", {{{'S', "Save"}, {'O', "Options"}, {16, "Messages"}, {'?', "Help"},
               {'Q', "Quit"}, {'R', "Rename"}, {'V', "Version"}, {18, "Redraw"}}}},
+  {"Display", {{{FE_ZOOM_IN, "Zoom in"}, {FE_HERO, "Hero"}, {FE_ANIM, "Animation"}, {FE_RUMBLE, "Rumble"},
+               {FE_ZOOM_OUT, "Zoom out"}, {FE_SMOOTH, "Smooth cam"}, {FE_FULLSCREEN, "Fullscreen"}, {FE_CLOSE, "Close"}}}},
 };
 const radial_page_def COUNTRY_PAGES[] = {
   {"Countryside", {{{'>', "Enter site"}, {'s', "Search"}, {'H', "Hunt"}, {'x', "Examine"},
                    {'i', "Inventory"}, {'e', "Eat"}, {'d', "Drop"}, {'E', "Dismount"}}}},
   {"System", {{{'S', "Save"}, {'O', "Options"}, {16, "Messages"}, {'?', "Help"},
               {'Q', "Quit"}, {'R', "Rename"}, {'V', "Version"}, {'/', "Identify char"}}}},
+  {"Display", {{{FE_ZOOM_IN, "Zoom in"}, {FE_HERO, "Hero"}, {FE_ANIM, "Animation"}, {FE_RUMBLE, "Rumble"},
+               {FE_ZOOM_OUT, "Zoom out"}, {FE_SMOOTH, "Smooth cam"}, {FE_FULLSCREEN, "Fullscreen"}, {FE_CLOSE, "Close"}}}},
 };
 
 bool in_country()
@@ -946,10 +1090,10 @@ const radial_page_def *pages(int &n)
 {
   if(in_country())
   {
-    n = 2;
+    n = 3;
     return COUNTRY_PAGES;
   }
-  n = 5;
+  n = 6;
   return DUNGEON_PAGES;
 }
 
@@ -974,12 +1118,22 @@ void draw_radial()
   text(cx_ - text_width(pgs) / 2, cy_ + ch / 4, pgs, {170, 170, 190, 255});
   for(int i = 0; i < 8; ++i)
   {
-    double ang = (i * 45 - 90) * M_PI / 180.0;
+    double ang = (i * 45 - 90) * PI / 180.0;
     int ix     = cx_ + static_cast<int>(std::cos(ang) * R);
     int iy     = cy_ + static_cast<int>(std::sin(ang) * R);
     bool sel   = i == radial_sel;
     disc(ix, iy, ch * 2 + (sel ? ch / 2 : 0), sel ? SDL_Color{255, 210, 70, 255} : SDL_Color{70, 64, 96, 255});
     std::string lab = p.items[i].label;
+    switch(p.items[i].key)
+    {
+      case FE_HERO: lab = "Hero: " + player_set; break;
+      case FE_ANIM: lab = anim_enabled ? "Anim: on" : "Anim: off"; break;
+      case FE_RUMBLE: lab = rumble_enabled ? "Rumble: on" : "Rumble: off"; break;
+      case FE_SMOOTH: lab = smooth_camera ? "Smooth: on" : "Smooth: off"; break;
+      case FE_ZOOM_IN:
+      case FE_ZOOM_OUT: lab += " (" + std::to_string(TILE_SIZES[tile_zoom]) + ")"; break;
+      default: break;
+    }
     SDL_Color tc    = sel ? SDL_Color{20, 16, 10, 255} : SDL_Color{240, 240, 250, 255};
     int ts          = ch;
     while(text_width(lab, ts) > ch * 5 && ts > 10)
@@ -1266,7 +1420,7 @@ void render()
   // text cursor
   if(scr.cursor_visibility && scr.cursor_win && scr.cursor_win != scr.map_win)
   {
-    if((anim_clock / 400) % 2 == 0)
+    if(!animating_now() || (anim_clock / 400) % 2 == 0)
     {
       fill(cell_x(scr, scr.cursor_y, scr.cursor_x), scr.cursor_y * ch + ch - 3, cw, 3, {255, 255, 255, 220});
     }
@@ -1282,6 +1436,96 @@ void render()
   SDL_RenderPresent(renderer);
   last_present = SDL_GetTicks();
   dirty        = false;
+
+  // when does the picture next change on its own? (nothing = sleep until input)
+  Uint32 now = last_present;
+  anim_due_at = UINT32_MAX;
+  if(animating_now())
+  {
+    Uint32 period = now - last_move_time < 700 ? 150 : 500;
+    anim_due_at   = now + (period - now % period);
+    if(scr.cursor_visibility && scr.cursor_win && scr.cursor_win != scr.map_win)
+    {
+      anim_due_at = std::min(anim_due_at, now + (400 - now % 400));
+    }
+    anim_due_at = std::min(anim_due_at, last_input + IDLE_FREEZE_MS); // settle on a still frame
+  }
+  if(flash_until > now)
+  {
+    anim_due_at = std::min(anim_due_at, flash_until);
+  }
+}
+
+// ------------------------------------------------------------- rumble ----
+void check_rumble()
+{
+  int hp, mx;
+  if(!omega_player_hp(hp, mx))
+  {
+    last_hp = -1;
+    return;
+  }
+  if(pad && rumble_enabled && last_hp >= 0 && mx == last_maxhp && hp < last_hp)
+  {
+    float f = std::clamp((last_hp - hp) * 4.0f / std::max(mx, 1), 0.3f, 1.0f);
+    Uint32 ms = hp <= 0 ? 600 : static_cast<Uint32>(110 + 170 * f);
+    SDL_GameControllerRumble(pad, static_cast<Uint16>(0xffff * f), static_cast<Uint16>(0xa000 * f), ms);
+  }
+  last_hp    = hp;
+  last_maxhp = mx;
+}
+
+// ----------------------------------------------------------- settings ----
+std::string settings_path()
+{
+  std::string p;
+  if(char *pref = SDL_GetPrefPath("", "OmegaDeck"))
+  {
+    p = std::string(pref) + "omegadeck.cfg";
+    SDL_free(pref);
+  }
+  return p;
+}
+
+bool start_fullscreen = false;
+
+void save_settings()
+{
+  std::string p = settings_path();
+  if(p.empty())
+  {
+    return;
+  }
+  std::ofstream o(p);
+  bool fs = window && (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP);
+  o << "zoom=" << tile_zoom << "\n"
+    << "hero=" << player_set << "\n"
+    << "animations=" << anim_enabled << "\n"
+    << "rumble=" << rumble_enabled << "\n"
+    << "smooth_camera=" << smooth_camera << "\n"
+    << "fullscreen=" << fs << "\n";
+}
+
+void load_settings()
+{
+  std::ifstream in(settings_path());
+  std::string line;
+  while(std::getline(in, line))
+  {
+    auto eq = line.find('=');
+    if(eq == std::string::npos)
+    {
+      continue;
+    }
+    std::string k = line.substr(0, eq), v = line.substr(eq + 1);
+    int n         = std::atoi(v.c_str());
+    if(k == "zoom") tile_zoom = std::clamp(n, 0, static_cast<int>(TILE_SIZES.size()) - 1);
+    else if(k == "hero" && !v.empty()) player_set = v;
+    else if(k == "animations") anim_enabled = n != 0;
+    else if(k == "rumble") rumble_enabled = n != 0;
+    else if(k == "smooth_camera") smooth_camera = n != 0;
+    else if(k == "fullscreen") start_fullscreen = n != 0;
+  }
 }
 
 // --------------------------------------------------------------- input ----
@@ -1395,6 +1639,44 @@ void on_dir(int d)
   }
 }
 
+void toggle_fullscreen()
+{
+  Uint32 f = SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP;
+  SDL_SetWindowFullscreen(window, f ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+}
+
+void do_fe_action(int k)
+{
+  int nz = static_cast<int>(TILE_SIZES.size());
+  switch(k)
+  {
+    case FE_ZOOM_IN: tile_zoom = std::min(tile_zoom + 1, nz - 1); break;
+    case FE_ZOOM_OUT: tile_zoom = std::max(tile_zoom - 1, 0); break;
+    case FE_HERO:
+    {
+      size_t i = 0;
+      for(; i < 4; ++i)
+      {
+        if(player_set == HEROES[i]) break;
+      }
+      player_set   = HEROES[(i + 1) % 4];
+      mcache.gen   = ~0u; // rebuild with the new sprite
+      break;
+    }
+    case FE_ANIM: anim_enabled = !anim_enabled; break;
+    case FE_RUMBLE:
+      rumble_enabled = !rumble_enabled;
+      if(rumble_enabled && pad) SDL_GameControllerRumble(pad, 0x8000, 0x6000, 150);
+      break;
+    case FE_SMOOTH: smooth_camera = !smooth_camera; break;
+    case FE_FULLSCREEN: toggle_fullscreen(); break;
+    case FE_CLOSE: radial_open = false; break;
+    default: break;
+  }
+  save_settings();
+  dirty = true;
+}
+
 void on_button(int b)
 {
   dirty = true;
@@ -1440,8 +1722,16 @@ void on_button(int b)
       case SDL_CONTROLLER_BUTTON_A:
         if(radial_sel >= 0)
         {
-          push_key(pg[std::clamp(radial_page, 0, n - 1)].items[radial_sel].key);
-          radial_open = false;
+          int k = pg[std::clamp(radial_page, 0, n - 1)].items[radial_sel].key;
+          if(k >= FE_ZOOM_IN)
+          {
+            do_fe_action(k); // display settings: stay open so several can be changed
+          }
+          else
+          {
+            push_key(k);
+            radial_open = false;
+          }
         }
         break;
       case SDL_CONTROLLER_BUTTON_B:
@@ -1450,7 +1740,7 @@ void on_button(int b)
         break;
       case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: radial_page = (radial_page + n - 1) % n; break;
       case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: radial_page = (radial_page + 1) % n; break;
-      case SDL_CONTROLLER_BUTTON_START: radial_page = n - 1; break;
+      case SDL_CONTROLLER_BUTTON_START: radial_page = n - 2; break;
       default: break;
     }
     return;
@@ -1458,6 +1748,7 @@ void on_button(int b)
   if(b == SDL_CONTROLLER_BUTTON_RIGHTSTICK)
   {
     tile_zoom = (tile_zoom + 1) % static_cast<int>(TILE_SIZES.size());
+    save_settings();
     return;
   }
   bool country = in_country();
@@ -1474,7 +1765,7 @@ void on_button(int b)
           int n;
           pages(n);
           radial_open = true;
-          radial_page = n - 1;
+          radial_page = n - 2; // System
           radial_sel  = -1;
           break;
         }
@@ -1553,7 +1844,7 @@ int held_dir()
   {
     return -1;
   }
-  double ang = std::atan2(fx, -fy) * 180.0 / M_PI; // 0 = up, clockwise
+  double ang = std::atan2(fx, -fy) * 180.0 / PI; // 0 = up, clockwise
   int sector = static_cast<int>(std::lround(ang / 45.0));
   return (sector % 8 + 8) % 8;
 }
@@ -1661,7 +1952,7 @@ void on_click(int x, int y, bool down)
     // tap a slice
     SDL_Rect area = view.active ? view.rect : SDL_Rect{0, 0, win_w, win_h - hint_h};
     int cx_ = area.x + area.w / 2, cy_ = area.y + area.h / 2;
-    double ang = std::atan2(x - cx_, -(y - cy_)) * 180.0 / M_PI;
+    double ang = std::atan2(x - cx_, -(y - cy_)) * 180.0 / PI;
     int s      = (static_cast<int>(std::lround(ang / 45.0)) % 8 + 8) % 8;
     radial_sel = s;
     on_button(SDL_CONTROLLER_BUTTON_A);
@@ -1754,11 +2045,9 @@ void handle_key(const SDL_KeyboardEvent &k)
     case SDLK_HOME: push_key(KEY_HOME); break;
     case SDLK_TAB: push_key('\t'); break;
     case SDLK_F11:
-    {
-      Uint32 f = SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP;
-      SDL_SetWindowFullscreen(window, f ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+      toggle_fullscreen();
+      save_settings();
       break;
-    }
     case SDLK_EQUALS:
       if(ctrl)
       {
@@ -1798,15 +2087,58 @@ void pump(int wait_ms)
   bool got = wait_ms > 0 ? SDL_WaitEventTimeout(&e, wait_ms) : SDL_PollEvent(&e);
   while(got)
   {
+    // anything the player does wakes animations back up
+    bool input = false;
+    switch(e.type)
+    {
+      case SDL_KEYDOWN:
+      case SDL_TEXTINPUT:
+      case SDL_MOUSEBUTTONDOWN:
+      case SDL_MOUSEWHEEL:
+      case SDL_FINGERDOWN:
+      case SDL_CONTROLLERBUTTONDOWN:
+        input = true;
+        break;
+      case SDL_CONTROLLERAXISMOTION:
+        input = std::abs(e.caxis.value) > 12000;
+        break;
+      default:
+        break;
+    }
+    if(input)
+    {
+      if(!animating_now())
+      {
+        dirty = true; // restart the animation schedule
+      }
+      last_input = SDL_GetTicks();
+    }
+    // pointer only shows while the mouse is being used
+    if(e.type == SDL_CONTROLLERBUTTONDOWN || (e.type == SDL_CONTROLLERAXISMOTION && input))
+    {
+      SDL_ShowCursor(SDL_DISABLE);
+    }
+    else if(e.type == SDL_MOUSEMOTION && e.motion.which != SDL_TOUCH_MOUSEID)
+    {
+      SDL_ShowCursor(SDL_ENABLE);
+    }
     switch(e.type)
     {
       case SDL_QUIT:
         omega_window_closed();
         break;
       case SDL_WINDOWEVENT:
-        if(e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED)
+        switch(e.window.event)
         {
-          handle_resize();
+          case SDL_WINDOWEVENT_SIZE_CHANGED: handle_resize(); break;
+          case SDL_WINDOWEVENT_FOCUS_LOST: backgrounded = true; break;
+          case SDL_WINDOWEVENT_FOCUS_GAINED: backgrounded = false; break;
+          case SDL_WINDOWEVENT_MINIMIZED:
+          case SDL_WINDOWEVENT_HIDDEN: minimized = true; break;
+          case SDL_WINDOWEVENT_RESTORED:
+          case SDL_WINDOWEVENT_SHOWN:
+          case SDL_WINDOWEVENT_MAXIMIZED: minimized = false; break;
+          default: break;
         }
         dirty = true;
         break;
@@ -1906,6 +2238,7 @@ void pump(int wait_ms)
 // for input. Used for automated testing of the pad controls.
 std::deque<std::string> script;
 bool script_loaded = false;
+Uint32 script_resume_at = 0;
 
 void save_shot(const std::string &path)
 {
@@ -1934,7 +2267,7 @@ bool run_script_step()
       }
     }
   }
-  if(script.empty())
+  if(script.empty() || SDL_GetTicks() < script_resume_at)
   {
     return false;
   }
@@ -1992,6 +2325,10 @@ bool run_script_step()
     o << "mode=" << mode() << " options=" << options.size() << " osk=" << osk_open << " radial=" << radial_open
       << " ctx=" << omega_context_label() << "\n";
   }
+  else if(cmd == "idle")
+  {
+    script_resume_at = SDL_GetTicks() + std::atoi(arg.c_str()); // sit idle like a player would
+  }
   else if(cmd == "env")
   {
     omega_debug_change_env(std::atoi(arg.c_str()));
@@ -2042,6 +2379,7 @@ void ui_pop_mode()
 
 bool fe_init(int &lines, int &cols)
 {
+  SDL_SetMainReady(); // we use the game's own main(), not SDL_main
   SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "0");
   SDL_SetHint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "1");
   if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_EVENTS) != 0)
@@ -2102,15 +2440,30 @@ bool fe_init(int &lines, int &cols)
     f >> font_w >> font_h;
   }
   load_tile_index(asset_dir + "tiles.txt");
+  load_settings();
   if(const char *p = SDL_getenv("OMEGA_HERO"))
   {
     player_set = p;
   }
+  if(const char *p = SDL_getenv("OMEGA_ANIM"))
+  {
+    anim_enabled = std::atoi(p) != 0;
+  }
+  if(start_fullscreen && !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP))
+  {
+    SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+  }
+  SDL_EnableScreenSaver(); // let the handheld dim/sleep the screen when idle
+  last_input = SDL_GetTicks();
 
   SDL_GameControllerEventState(SDL_ENABLE);
   for(int i = 0; i < SDL_NumJoysticks(); ++i)
   {
     open_pad(i);
+  }
+  if(pad)
+  {
+    SDL_ShowCursor(SDL_DISABLE);
   }
   SDL_StartTextInput();
   compute_grid(lines, cols);
@@ -2147,7 +2500,8 @@ void fe_present_if_due()
   {
     return;
   }
-  if(dirty && SDL_GetTicks() - last_present >= 33)
+  check_rumble();
+  if(dirty && !minimized && SDL_GetTicks() - last_present >= 33)
   {
     render();
   }
@@ -2159,8 +2513,9 @@ int fe_get_key(int timeout_ms)
   {
     return ERR;
   }
-  Uint32 start = SDL_GetTicks();
+  Uint32 start   = SDL_GetTicks();
   bool rescanned = false;
+  check_rumble();
   while(true)
   {
     if(!keyq.empty())
@@ -2174,9 +2529,11 @@ int fe_get_key(int timeout_ms)
     {
       scan_options(sdlc_screen());
       rescanned = true;
+    }
+    if(!script.empty() || !script_loaded)
+    {
       if(run_script_step())
       {
-        rescanned = false;
         continue;
       }
     }
@@ -2189,12 +2546,32 @@ int fe_get_key(int timeout_ms)
       }
       continue;
     }
-    // animate while idle
-    if(dirty || SDL_GetTicks() - last_present > 100)
+    // Draw only when something changed or an animation frame is due, then sleep
+    // until the next thing that needs us. Idle = no wake-ups at all.
+    Uint32 now = SDL_GetTicks();
+    if(!minimized && (dirty || cam_moving || now >= anim_due_at))
     {
       render();
+      now = SDL_GetTicks();
     }
-    int wait = 16;
+    Uint32 wake = UINT32_MAX;
+    if(cam_moving && !minimized)
+    {
+      wake = now + 1; // vsync paces the camera glide
+    }
+    if(!minimized)
+    {
+      wake = std::min(wake, anim_due_at);
+    }
+    if(cur_dir >= 0)
+    {
+      wake = std::min(wake, dir_fire_at);
+    }
+    if(!script.empty())
+    {
+      wake = std::min(wake, now + 20);
+    }
+    int wait = wake == UINT32_MAX ? 10000 : static_cast<int>(std::clamp<Sint64>(static_cast<Sint64>(wake) - now, 1, 10000));
     if(timeout_ms > 0)
     {
       int left = static_cast<int>(timeout_ms - (SDL_GetTicks() - start));
